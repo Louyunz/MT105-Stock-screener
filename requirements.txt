@@ -1,0 +1,34 @@
+# Stock Smart Screener — 依赖清单
+# MFT105 · Python 及其在金融中的应用
+
+
+pillow==12.1.1
+
+# 数据获取
+yfinance==1.2.0
+pandas-datareader==0.10.0
+
+# 数据处理
+pandas==2.3.3
+numpy==2.4.3
+scipy==1.17.1
+scikit-learn==1.8.0
+
+# 日期计算
+python-dateutil==2.9.0.post0
+
+# 可视化
+matplotlib==3.10.8
+plotly==6.6.0
+
+# Web 界面
+streamlit==1.55.0
+openpyxl==3.1.5
+
+# 代码质量
+pylint==4.0.5
+
+# 可选：加速 parquet 缓存
+pyarrow==23.0.1
+
+setuptools==82.0.1

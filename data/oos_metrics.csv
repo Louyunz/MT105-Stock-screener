@@ -1,0 +1,2 @@
+strategy_cagr,baseline_cagr,strategy_sharpe,baseline_sharpe,strategy_max_drawdown,baseline_max_drawdown,information_ratio,monthly_win_rate,strategy_annualized_vol,baseline_annualized_vol
+0.08925227080373865,0.16505432273029386,0.4207992800067538,0.990396709088038,-0.14242265502493,-0.11688140591602873,-0.8358824508621576,0.43478260869565216,0.14358122057147826,0.1266691705282792
