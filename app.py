@@ -27,7 +27,54 @@ import streamlit as st
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
+from src.investor_profile import (
+    RISK_PROFILE_LABELS,
+    RISK_QUESTIONS,
+    assess_investor_risk_profile,
+    load_investor_profile,
+    save_investor_profile,
+)
+
 logging.basicConfig(level=logging.WARNING)
+
+CHART_BG = "#ffffff"
+CHART_TEXT = "#0f172a"
+CHART_GRID = "#dbe4ee"
+CHART_BORDER = "#cbd5e1"
+
+
+def apply_chart_theme(fig: go.Figure, *, height: int | None = None, title: str | None = None, showlegend: bool | None = None) -> go.Figure:
+    """Apply a readable light theme to Plotly figures."""
+    fig.update_layout(
+        template="plotly_white",
+        plot_bgcolor=CHART_BG,
+        paper_bgcolor=CHART_BG,
+        font=dict(color=CHART_TEXT),
+        legend=dict(font=dict(color=CHART_TEXT)),
+        margin={"t": 20, "b": 20, "l": 20, "r": 20},
+    )
+    if title is not None:
+        fig.update_layout(title=dict(text=title, font=dict(color=CHART_TEXT)))
+    if height is not None:
+        fig.update_layout(height=height)
+    if showlegend is not None:
+        fig.update_layout(showlegend=showlegend)
+
+    fig.update_xaxes(
+        gridcolor=CHART_GRID,
+        zerolinecolor=CHART_BORDER,
+        linecolor=CHART_BORDER,
+        tickfont=dict(color=CHART_TEXT),
+        title_font=dict(color=CHART_TEXT),
+    )
+    fig.update_yaxes(
+        gridcolor=CHART_GRID,
+        zerolinecolor=CHART_BORDER,
+        linecolor=CHART_BORDER,
+        tickfont=dict(color=CHART_TEXT),
+        title_font=dict(color=CHART_TEXT),
+    )
+    return fig
 
 # ── Page config ─────────────────────────────────────────────────────────────
 
@@ -57,10 +104,11 @@ st.markdown(
     }
     .metric-value {
         font-family: 'IBM Plex Mono', monospace;
+        color: #58a6ff;
         font-size: 1.8rem;
         font-weight: 600;
     }
-    .metric-label { color: #8b949e; font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.08em; }
+    .metric-label { color: #f0f8ff; font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.08em; }
     .positive { color: #3fb950; }
     .negative { color: #f85149; }
     .neutral  { color: #58a6ff; }
@@ -80,13 +128,23 @@ st.markdown(
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 
+profile_data = load_investor_profile()
+if profile_data:
+    profile_stamp = profile_data.get("assessed_at")
+    if st.session_state.get("risk_profile_profile_stamp") != profile_stamp:
+        st.session_state["risk_profile"] = profile_data["recommended_profile"]
+        st.session_state["risk_profile_profile_stamp"] = profile_stamp
+    st.session_state["investor_profile"] = profile_data
+elif "risk_profile" not in st.session_state:
+    st.session_state["risk_profile"] = "balanced"
+
 with st.sidebar:
     st.markdown("## ⚙️ 参数配置")
     st.divider()
 
     universe_choice = st.selectbox(
         "股票池",
-        ["S&P 500 (前50只，演示用)", "S&P 500" , "自定义代码列表"],
+        ["S&P 500", "自定义代码列表"],
     )
     if universe_choice == "自定义代码列表":
         custom_tickers_input = st.text_area(
@@ -104,12 +162,21 @@ with st.sidebar:
 
     st.divider()
     top_n = st.slider("持仓数量 N", min_value=5, max_value=100, value=40, step=1)
+    risk_profile_label = "风险偏好"
+    if profile_data:
+        risk_profile_label = f"风险偏好（测验推荐：{RISK_PROFILE_LABELS[profile_data['recommended_profile']]}）"
+    else:
+        risk_profile_label = "风险偏好（首次使用请先完成测验）"
     risk_profile = st.select_slider(
-        "风险偏好",
+        risk_profile_label,
         options=["conservative", "balanced", "aggressive"],
-        value="balanced",
+        key="risk_profile",
         format_func=lambda x: {"conservative": "保守", "balanced": "平衡", "aggressive": "积极"}[x],
     )
+    if profile_data:
+        st.caption(f"已读取上次测验结果：{RISK_PROFILE_LABELS[profile_data['recommended_profile']]}")
+    else:
+        st.caption("完成主页面测验后，系统会自动保存并填充该默认值。")
     rebalance_freq = st.selectbox(
         "再平衡频率",
         ["monthly", "quarterly", "semi-annual"],
@@ -126,7 +193,12 @@ with st.sidebar:
     force_refresh = st.checkbox("强制刷新数据缓存", value=False)
     run_backtest_flag = st.checkbox("运行回测评估（较慢）", value=False)
 
-    run_btn = st.button("🚀 运行筛选", type="primary", use_container_width=True)
+    run_btn = st.button(
+        "🚀 运行筛选",
+        type="primary",
+        use_container_width=True,
+        disabled=profile_data is None,
+    )
 
 # ── Main Panel ───────────────────────────────────────────────────────────────
 
@@ -139,6 +211,53 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+if profile_data:
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-label">投资者风险画像</div>
+            <div class="metric-value">{profile_data['recommended_label']}</div>
+            <div style="color:#f0f8ff; margin-top:6px;">
+                得分 {profile_data['total_score']} / {profile_data['max_score']} · {profile_data['recommended_description']}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.expander("查看测验明细", expanded=False):
+        profile_df = pd.DataFrame(profile_data.get("answer_details", []))
+        if not profile_df.empty:
+            st.dataframe(profile_df, use_container_width=True, hide_index=True)
+        else:
+            st.write("暂无测验明细。")
+else:
+    st.markdown("### 首次启动：投资者风险倾向测验")
+    st.caption("完成后将把结果写入 data/investor_risk_profile.json，并自动作为默认风险偏好。")
+
+    with st.form("investor_risk_survey"):
+        survey_answers: dict[str, str] = {}
+        for question in RISK_QUESTIONS:
+            option_values = [option["value"] for option in question["options"]]
+            option_labels = {option["value"]: option["label"] for option in question["options"]}
+            survey_answers[question["key"]] = st.radio(
+                question["label"],
+                options=option_values,
+                format_func=lambda value, labels=option_labels: labels[value],
+                key=f"survey_{question['key']}",
+            )
+            st.caption(question.get("help", ""))
+
+        submitted = st.form_submit_button("生成风险画像", type="primary", use_container_width=True)
+
+    if submitted:
+        profile_data = assess_investor_risk_profile(survey_answers)
+        save_investor_profile(profile_data)
+        st.session_state["investor_profile"] = profile_data
+        st.rerun()
+
+    st.info("请先完成上方测验，系统会先保存风险画像，再进入筛选页面。")
+    st.stop()
 
 if not run_btn:
     st.info("👈 在左侧配置参数后，点击「运行筛选」开始分析。")
@@ -276,16 +395,11 @@ with tab1:
             marker_color=colors,
             text=[f"{v:.3f}" for v in plot_df["factor_score"]],
             textposition="outside",
+            textfont=dict(color=CHART_TEXT),
         ))
-        fig_bar.update_layout(
-            height=max(400, len(plot_df) * 28),
-            xaxis_title="Factor Score",
-            yaxis={"autorange": "reversed"},
-            plot_bgcolor="#0d1117",
-            paper_bgcolor="#0d1117",
-            font_color="#e6edf3",
-            margin={"t": 10, "b": 40},
-        )
+        fig_bar = apply_chart_theme(fig_bar, height=max(400, len(plot_df) * 28))
+        fig_bar.update_layout(xaxis_title="Factor Score", margin={"t": 10, "b": 40})
+        fig_bar.update_yaxes(autorange="reversed")
         st.plotly_chart(fig_bar, use_container_width=True)
 
     with col_right:
@@ -301,7 +415,7 @@ with tab1:
                 "volatility_z": "{:.2f}",
                 "value_z": "{:.2f}",
                 "quality_z": "{:.2f}",
-            }),
+            }).set_properties(**{"background-color": CHART_BG, "color": CHART_TEXT}),
             use_container_width=True,
             height=500,
         )
@@ -331,12 +445,13 @@ with tab1:
             name=ticker,
             opacity=0.7,
         ))
+    fig_radar = apply_chart_theme(fig_radar, height=500)
     fig_radar.update_layout(
-        polar={"radialaxis": {"visible": True}},
-        plot_bgcolor="#0d1117",
-        paper_bgcolor="#0d1117",
-        font_color="#e6edf3",
-        height=500,
+        polar={
+            "bgcolor": CHART_BG,
+            "radialaxis": {"visible": True, "tickfont": {"color": CHART_TEXT}, "gridcolor": CHART_GRID},
+            "angularaxis": {"tickfont": {"color": CHART_TEXT}},
+        },
         margin={"t": 20},
     )
     st.plotly_chart(fig_radar, use_container_width=True)
@@ -356,12 +471,10 @@ with tab1:
             ))
     fig_box.update_layout(
         height=400,
-        plot_bgcolor="#0d1117",
-        paper_bgcolor="#0d1117",
-        font_color="#e6edf3",
         showlegend=False,
         yaxis_title="Z-score",
     )
+    fig_box = apply_chart_theme(fig_box, height=400)
     st.plotly_chart(fig_box, use_container_width=True)
 
 
@@ -381,14 +494,9 @@ with tab2:
             hole=0.4,
             color_discrete_sequence=px.colors.qualitative.Bold,
         )
-        fig_pie.update_layout(
-            plot_bgcolor="#0d1117",
-            paper_bgcolor="#0d1117",
-            font_color="#e6edf3",
-            height=420,
-            margin={"t": 20},
-            legend={"font": {"size": 11}},
-        )
+        fig_pie.update_traces(textfont=dict(color=CHART_TEXT))
+        fig_pie = apply_chart_theme(fig_pie, height=420)
+        fig_pie.update_layout(margin={"t": 20}, legend={"font": {"size": 11, "color": CHART_TEXT}})
         st.plotly_chart(fig_pie, use_container_width=True)
 
     with col_b:
@@ -396,7 +504,7 @@ with tab2:
         fmt_cols = {"weight_pct": "{:.2f}%", "amount_usd": "${:,.0f}",
                     "latest_price": "${:.2f}", "shares_approx": "{:.1f}"}
         st.dataframe(
-            portfolio.style.format(fmt_cols),
+            portfolio.style.format(fmt_cols).set_properties(**{"background-color": CHART_BG, "color": CHART_TEXT}),
             use_container_width=True,
             height=420,
         )
@@ -462,14 +570,8 @@ with tab3:
                     color_discrete_map={"策略组合": "#f85149", "S&P 500 Baseline": "#58a6ff"},
                     title="OOS 净值曲线（2023–2024）",
                 )
-                fig_nav.update_layout(
-                    plot_bgcolor="#0d1117",
-                    paper_bgcolor="#0d1117",
-                    font_color="#e6edf3",
-                    height=420,
-                    xaxis_title="日期",
-                    yaxis_title="净值",
-                )
+                fig_nav = apply_chart_theme(fig_nav, height=420)
+                fig_nav.update_layout(xaxis_title="日期", yaxis_title="净值")
                 st.plotly_chart(fig_nav, use_container_width=True)
 
                 # Baseline 对比表
@@ -481,7 +583,11 @@ with tab3:
                     "Baseline": [f"{m['baseline_cagr']:.2%}", f"{m['baseline_sharpe']:.2f}",
                                  f"{m['baseline_max_drawdown']:.2%}", f"{m['baseline_annualized_vol']:.2%}"],
                 })
-                st.table(compare_df)
+                st.dataframe(
+                    compare_df.style.set_properties(**{"background-color": CHART_BG, "color": CHART_TEXT}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
             except Exception as e:
                 st.error(f"回测失败: {e}")

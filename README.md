@@ -97,6 +97,7 @@ streamlit run app.py
 ```
 
 浏览器访问 `http://localhost:8501`，在侧边栏配置参数后点击「运行筛选」。
+首次打开时会先完成一次风险倾向测验，结果会保存到 `data/investor_risk_profile.json`，后续启动会自动读取并作为风险偏好默认值。
 
 ---
 
