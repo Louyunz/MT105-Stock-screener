@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -59,7 +60,16 @@ def _add_metric(col, label: str, value: str, help_text: str, delta: str | None =
         col.metric(label, value, delta=delta, help=help_text)
 
 
-def _build_ai_advice_prompt(results_oos: dict, top_n_df: pd.DataFrame, portfolio: pd.DataFrame, risk_profile: str, weight_method: str, capital: float) -> str:
+def _build_ai_advice_prompt(
+    results_oos: dict,
+    top_n_df: pd.DataFrame,
+    portfolio: pd.DataFrame,
+    risk_profile: str,
+    weight_method: str,
+    capital: float,
+    backtest_start: str,
+    backtest_end: str,
+) -> str:
     metrics = results_oos["metrics"]
     top_stocks = top_n_df[[c for c in ["ticker", "factor_score", "sector"] if c in top_n_df.columns]].head(8)
     portfolio_view = portfolio[[c for c in ["ticker", "weight_pct", "amount_usd"] if c in portfolio.columns]].head(8)
@@ -70,7 +80,7 @@ def _build_ai_advice_prompt(results_oos: dict, top_n_df: pd.DataFrame, portfolio
         f"投资者风险偏好: {RISK_PROFILE_LABELS.get(risk_profile, risk_profile)}\n"
         f"组合方式: {WEIGHT_METHOD_LABELS.get(weight_method, weight_method)}\n"
         f"本金假设: {capital:,.0f} 美元\n"
-        f"样本外时间: 2023-01-01 到 2024-12-31\n"
+        f"样本外时间: {backtest_start} 到 {backtest_end}\n"
         f"策略CAGR: {metrics['strategy_cagr']:.2%}\n"
         f"基准CAGR: {metrics['baseline_cagr']:.2%}\n"
         f"策略Sharpe: {metrics['strategy_sharpe']:.2f}\n"
@@ -271,9 +281,17 @@ with st.sidebar:
         ]
     else:
         raw_tickers = None  # 将在 run 时获取
-
+    custom_date_range = st.checkbox("自定义回测日期范围", value=False)
+    if custom_date_range:
+        default_end_date = pd.to_datetime(time.strftime("%Y-%m-%d"))
+        default_start_date = default_end_date - pd.DateOffset(years=5)
+        start_date = st.date_input("回测开始日期", value=default_start_date)
+        end_date = st.date_input("回测结束日期", value=pd.to_datetime(time.strftime("%Y-%m-%d")))
+        if start_date >= end_date:
+            st.error("开始日期必须早于结束日期。")
+            st.stop()
     st.divider()
-    top_n = st.slider("持仓数量 N", min_value=5, max_value=100, value=40, step=1)
+    top_n = st.slider("持仓数量 N", min_value=1, max_value=20, value=5, step=1)
     risk_profile_label = "风险偏好"
     if profile_data:
         risk_profile_label = f"风险偏好（测验推荐：{RISK_PROFILE_LABELS[profile_data['recommended_profile']]}）"
@@ -437,30 +455,36 @@ try:
 
     # 2. 下载数据
     with st.spinner("下载价格与财务数据..."):
+        if custom_date_range:
+            start_str = start_date.strftime("%Y-%m-%d")
+            end_str = end_date.strftime("%Y-%m-%d")
+        else:
+            end_str = time.strftime("%Y-%m-%d")
+            start_str = (pd.to_datetime(end_str) - pd.DateOffset(years=10)).strftime("%Y-%m-%d")
         prices = download_prices(
             tickers=tickers,
-            start="2015-01-01",
-            end="2024-12-31",
+            start=start_str,
+            end=end_str,
             force_refresh=force_refresh,
         )
         benchmark_prices = download_benchmark_prices(
             ticker="^GSPC",
-            start="2015-01-01",
-            end="2024-12-31",
+            start=start_str,
+            end=end_str,
             force_refresh=force_refresh,
         )
         fundamentals = download_fundamentals(tickers=tickers, force_refresh=force_refresh)
         rf_rate = get_risk_free_rate()
 
     # IS 价格
-    prices_is = prices.loc["2015-01-01":"2022-12-31"]
+    prices_is = prices.loc[start_str:end_str]
 
     # 3. 因子计算
     with st.spinner("计算因子分数..."):
         top_n_df, all_scores = screen_stocks(
             prices=prices_is,
             fundamentals=fundamentals,
-            benchmark_prices=benchmark_prices.loc["2015-01-01":"2022-12-31"],
+            benchmark_prices=benchmark_prices.loc[start_str:end_str],
             top_n=top_n,
             risk_profile=risk_profile,
         )
@@ -536,7 +560,7 @@ top_three = "、".join(top_n_df["ticker"].head(3).tolist()) if "ticker" in top_n
 st.markdown(
     f"""
     <div class="insight-box">
-        <strong>给普通投资者的结论</strong>
+        <strong>给投资者的建议</strong>
         <ul>
             <li>当前风格：{RISK_PROFILE_LABELS.get(risk_profile, risk_profile)}，组合方式：{WEIGHT_METHOD_LABELS.get(weight_method, weight_method)}。</li>
             <li>优先关注的前 3 只股票：{top_three}。</li>
@@ -715,14 +739,14 @@ with tab3:
         else:
             from src.backtester import run_backtest
 
-            with st.spinner("运行 Out-of-Sample 回测（2023-2024）..."):
+            with st.spinner(f"运行 Out-of-Sample 回测（{start_str} 到 {end_str}）..."):
                 try:
                     results_oos = run_backtest(
                         prices=prices,
                         fundamentals=fundamentals,
                         benchmark_prices=benchmark_prices,
-                        start="2023-01-01",
-                        end="2024-12-31",
+                        start=start_str,
+                        end=end_str,
                         top_n=top_n,
                         risk_profile=risk_profile,
                         rebalance_freq=rebalance_freq,
@@ -732,9 +756,9 @@ with tab3:
                     m = results_oos["metrics"]
 
                     # 指标卡
-                    st.markdown("**Out-of-Sample 绩效指标（2023–2024）**")
+                    st.markdown(f"**Out-of-Sample 绩效指标（{start_str} 到 {end_str}）**")
                     st.info(
-                        "验证机制说明：这里使用样本外 OOS（2023–2024）进行检验，并与 S&P 500 基准对照。"
+                        f"验证机制说明：这里使用样本外 OOS（{start_str} 到 {end_str}）进行检验，并与 S&P 500 基准对照。"
                         "重点不是单看收益高低，而是同时看 CAGR、Sharpe、最大回撤、信息比率和月度胜率。"
                         "如果策略在 OOS 中不能稳定优于基准，就只能把它当作筛选参考，而不是直接重仓依据。"
                     )
@@ -775,7 +799,7 @@ with tab3:
                     fig_nav = px.line(
                         nav_df, x=nav_df.index, y=["策略组合", "S&P 500 Baseline"],
                         color_discrete_map={"策略组合": "#f85149", "S&P 500 Baseline": "#58a6ff"},
-                        title="OOS 净值曲线（2023–2024）",
+                        title=f"OOS 净值曲线（{start_str} – {end_str}）",
                     )
                     fig_nav = apply_chart_theme(fig_nav, height=420)
                     fig_nav.update_layout(xaxis_title="日期", yaxis_title="净值")
@@ -838,7 +862,16 @@ with tab3:
             st.warning("当前没有可用的回测结果，请先确保回测成功完成。")
         else:
             try:
-                prompt = _build_ai_advice_prompt(results_oos, top_n_df, portfolio, risk_profile, weight_method, capital)
+                prompt = _build_ai_advice_prompt(
+                    results_oos,
+                    top_n_df,
+                    portfolio,
+                    risk_profile,
+                    weight_method,
+                    capital,
+                    start_str,
+                    end_str,
+                )
                 if ai_prompt_requirement.strip():
                     prompt = ai_prompt_requirement.strip() + "\n\n" + prompt
 
