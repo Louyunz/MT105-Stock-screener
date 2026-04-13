@@ -14,9 +14,13 @@ Streamlit 交互式 Web 界面
 """
 
 import io
+import hashlib
+import json
 import logging
 import sys
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
@@ -41,6 +45,98 @@ CHART_BG = "#ffffff"
 CHART_TEXT = "#0f172a"
 CHART_GRID = "#dbe4ee"
 CHART_BORDER = "#cbd5e1"
+
+WEIGHT_METHOD_LABELS = {
+    "equal_weight": "等权重",
+    "risk_parity": "风险平价",
+}
+
+
+def _add_metric(col, label: str, value: str, help_text: str, delta: str | None = None):
+    if delta is None:
+        col.metric(label, value, help=help_text)
+    else:
+        col.metric(label, value, delta=delta, help=help_text)
+
+
+def _build_ai_advice_prompt(results_oos: dict, top_n_df: pd.DataFrame, portfolio: pd.DataFrame, risk_profile: str, weight_method: str, capital: float) -> str:
+    metrics = results_oos["metrics"]
+    top_stocks = top_n_df[[c for c in ["ticker", "factor_score", "sector"] if c in top_n_df.columns]].head(8)
+    portfolio_view = portfolio[[c for c in ["ticker", "weight_pct", "amount_usd"] if c in portfolio.columns]].head(8)
+
+    return (
+        "你是一名面向普通投资者的量化投顾，只能基于给定的回测与组合数据给出保守、可执行的建议。"
+        "不要承诺收益，不要夸大，不要给出个股买卖点，只能给出仓位、风控、再平衡和观察要点。\n\n"
+        f"投资者风险偏好: {RISK_PROFILE_LABELS.get(risk_profile, risk_profile)}\n"
+        f"组合方式: {WEIGHT_METHOD_LABELS.get(weight_method, weight_method)}\n"
+        f"本金假设: {capital:,.0f} 美元\n"
+        f"样本外时间: 2023-01-01 到 2024-12-31\n"
+        f"策略CAGR: {metrics['strategy_cagr']:.2%}\n"
+        f"基准CAGR: {metrics['baseline_cagr']:.2%}\n"
+        f"策略Sharpe: {metrics['strategy_sharpe']:.2f}\n"
+        f"基准Sharpe: {metrics['baseline_sharpe']:.2f}\n"
+        f"策略最大回撤: {metrics['strategy_max_drawdown']:.2%}\n"
+        f"基准最大回撤: {metrics['baseline_max_drawdown']:.2%}\n"
+        f"信息比率: {metrics['information_ratio']:.2f}\n"
+        f"月度胜率: {metrics['monthly_win_rate']:.2%}\n\n"
+        f"Top N 股票摘要:\n{top_stocks.to_string(index=False)}\n\n"
+        f"组合权重摘要:\n{portfolio_view.to_string(index=False)}\n\n"
+        "请输出以下四部分：1) 一句话结论；2) 对普通投资者是否值得跟随；3) 风险提示；4) 下一步操作建议。"
+    )
+
+
+def _call_deepseek(api_key: str, prompt: str) -> str:
+    api_key = (api_key or "").strip().strip('"').strip("'")
+    if api_key.lower().startswith("bearer "):
+        # 用户可能把 "Bearer <key>" 整段贴进输入框，这里自动兼容。
+        api_key = api_key.split(" ", 1)[1].strip()
+
+    if not api_key:
+        raise RuntimeError("DeepSeek API Key 为空，请在侧边栏输入有效的 sk- 开头密钥。")
+
+    try:
+        api_key.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise RuntimeError(
+            "DeepSeek API Key 包含非 ASCII 字符。请仅粘贴原始密钥（通常以 sk- 开头），"
+            "不要包含中文说明、全角符号或额外文本。"
+        ) from exc
+
+    url = "https://api.deepseek.com/chat/completions"
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [
+            {"role": "system", "content": "你是一个谨慎、透明、面向普通投资者的量化投顾。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+    }
+    request = Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=60) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise RuntimeError(f"DeepSeek 接口返回错误: {exc.code} {exc.reason}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"DeepSeek 网络请求失败: {exc.reason}") from exc
+
+    choices = response_data.get("choices", [])
+    if not choices:
+        raise RuntimeError("DeepSeek 未返回可用建议。")
+    message = choices[0].get("message", {})
+    content = message.get("content", "")
+    if not content:
+        raise RuntimeError("DeepSeek 返回内容为空。")
+    return content
 
 
 def apply_chart_theme(fig: go.Figure, *, height: int | None = None, title: str | None = None, showlegend: bool | None = None) -> go.Figure:
@@ -121,6 +217,22 @@ st.markdown(
         font-weight: 600;
         color: #e6edf3;
     }
+
+    .insight-box {
+        background: linear-gradient(135deg, rgba(88,166,255,0.12), rgba(31,111,235,0.06));
+
+        border-radius: 12px;
+        padding: 16px 18px;
+        margin: 12px 0 16px 0;
+        color: #3d7bc2;
+    }
+    .insight-box ul {
+        margin: 10px 0 0 18px;
+        padding: 0;
+    }
+    .insight-box li {
+        margin: 6px 0;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -192,6 +304,28 @@ with st.sidebar:
     st.divider()
     force_refresh = st.checkbox("强制刷新数据缓存", value=False)
     run_backtest_flag = st.checkbox("运行回测评估（较慢）", value=False)
+
+    st.divider()
+    st.markdown("### 🤖 AI 投顾配置")
+    st.caption("这些输入只保存在当前会话中，不会写入文件或缓存。建议在点击运行前先填写。")
+    api_key = st.text_input(
+        "DeepSeek API Key",
+        type="password",
+        placeholder="sk-...",
+        help="仅用于本次会话的 AI 投顾调用，不会保存到本地。",
+        key="deepseek_api_key_input",
+    )
+    ai_prompt_requirement = st.text_area(
+        "提示词要求",
+        value=(
+            "请用普通投资者能看懂的方式回答，只给出可执行建议；"
+            "不要承诺收益，不要夸大结果，不要输出个股买卖点；"
+            "请围绕仓位、风险、再平衡和是否值得跟随策略进行分析。"
+        ),
+        height=140,
+        help="你可以补充希望 AI 特别关注的角度，例如回撤、稳定性或仓位控制。",
+        key="ai_prompt_requirement",
+    )
 
     run_btn = st.button(
         "🚀 运行筛选",
@@ -270,6 +404,7 @@ if not run_btn:
         | 🏆 评分排名 | Z-score 标准化 + 加权综合 Factor Score |
         | 💼 组合构建 | 等权重 / 风险平价 · 持仓金额建议 |
         | 🔄 再平衡 | 月度/季度/半年度 · 换手率与交易成本估算 |
+        | 🤖 AI投顾 | 基于回测结果的智能投资建议 |
         | 📈 回测评估 | CAGR · Sharpe · 最大回撤 · 信息比率 · 月胜率 |
         """
     )
@@ -350,31 +485,72 @@ except Exception as e:
 
 # ---------- 概览指标卡 ----------
 st.markdown('<div class="section-header">📊 筛选结果概览</div>', unsafe_allow_html=True)
+st.caption("鼠标悬停在下方指标上可以查看解释；这些指标不是单纯展示结果，而是帮助普通投资者判断是否值得继续看回测和组合建议。")
 
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
     top_score = top_n_df["factor_score"].max()
-    st.metric("最高 Factor Score", f"{top_score:.3f}")
+    _add_metric(
+        col1,
+        "最高 Factor Score",
+        f"{top_score:.3f}",
+        "综合得分越高，说明股票在相对动量、波动率、估值与品质上的综合表现越好。",
+    )
 
 with col2:
-    st.metric("持仓股票数", f"{len(top_n_df)} 只")
+    _add_metric(
+        col2,
+        "持仓股票数",
+        f"{len(top_n_df)} 只",
+        "最终纳入建议组合的股票数量。数量越少，组合越集中；数量越多，通常越分散。",
+    )
 
 with col3:
     if "sector" in top_n_df.columns:
         sectors = top_n_df["sector"].nunique()
-        st.metric("覆盖行业数", f"{sectors} 个")
+        _add_metric(
+            col3,
+            "覆盖行业数",
+            f"{sectors} 个",
+            "建议组合覆盖的行业数量。覆盖越广，单一行业波动对组合影响通常越小。",
+        )
     else:
-        st.metric("投资本金", f"${capital:,.0f}")
+        _add_metric(
+            col3,
+            "投资本金",
+            f"${capital:,.0f}",
+            "用于测算持仓金额和再平衡结果的假设本金。",
+        )
 
 with col4:
     avg_score = top_n_df["factor_score"].mean()
-    st.metric("平均 Factor Score", f"{avg_score:.3f}")
+    _add_metric(
+        col4,
+        "平均 Factor Score",
+        f"{avg_score:.3f}",
+        "Top N 股票的平均综合得分。这个值越高，说明整组股票整体越强。",
+    )
+
+top_three = "、".join(top_n_df["ticker"].head(3).tolist()) if "ticker" in top_n_df.columns else "无"
+st.markdown(
+    f"""
+    <div class="insight-box">
+        <strong>给普通投资者的结论</strong>
+        <ul>
+            <li>当前风格：{RISK_PROFILE_LABELS.get(risk_profile, risk_profile)}，组合方式：{WEIGHT_METHOD_LABELS.get(weight_method, weight_method)}。</li>
+            <li>优先关注的前 3 只股票：{top_three}。</li>
+            <li>如果你更在意稳健，建议优先看低波动或风险平价版本；如果你更在意上涨弹性，可以优先看综合得分最高的标的。</li>
+        </ul>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.divider()
 
 # ---------- Tab 布局 ----------
-tab1, tab2, tab3, tab4 = st.tabs(["🏆 因子排名", "💼 持仓组合", "📈 回测评估", "📥 数据下载"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["🏆 因子排名", "💼 持仓组合", "📈 回测评估", "🤖AI投顾","📥 数据下载"])
 
 # ─── Tab 1: 因子排名 ───────────────────────────────────────────────────────────
 with tab1:
@@ -396,6 +572,7 @@ with tab1:
             text=[f"{v:.3f}" for v in plot_df["factor_score"]],
             textposition="outside",
             textfont=dict(color=CHART_TEXT),
+            hovertemplate="股票：%{y}<br>综合得分：%{x:.3f}<extra>Factor Score</extra>",
         ))
         fig_bar = apply_chart_theme(fig_bar, height=max(400, len(plot_df) * 28))
         fig_bar.update_layout(xaxis_title="Factor Score", margin={"t": 10, "b": 40})
@@ -528,74 +705,165 @@ with tab2:
 
 # ─── Tab 3: 回测评估 ──────────────────────────────────────────────────────────
 with tab3:
-    if not run_backtest_flag:
-        st.info("💡 在左侧勾选「运行回测评估」后重新点击运行，以查看回测结果。")
-    else:
-        from src.backtester import run_backtest
+    results_oos = None
+    left_col, right_col = st.columns([3, 2])
 
-        with st.spinner("运行 Out-of-Sample 回测（2023-2024）..."):
+    with left_col:
+        if not run_backtest_flag:
+            st.info("💡 在左侧勾选「运行回测评估」后重新点击运行，以查看回测结果。")
+            st.caption("DeepSeek API Key 和提示词要求请先在侧边栏填写；只有在回测运行后才能基于结果给出建议。")
+        else:
+            from src.backtester import run_backtest
+
+            with st.spinner("运行 Out-of-Sample 回测（2023-2024）..."):
+                try:
+                    results_oos = run_backtest(
+                        prices=prices,
+                        fundamentals=fundamentals,
+                        benchmark_prices=benchmark_prices,
+                        start="2023-01-01",
+                        end="2024-12-31",
+                        top_n=top_n,
+                        risk_profile=risk_profile,
+                        rebalance_freq=rebalance_freq,
+                        weight_method=weight_method,
+                        risk_free_rate=rf_rate,
+                    )
+                    m = results_oos["metrics"]
+
+                    # 指标卡
+                    st.markdown("**Out-of-Sample 绩效指标（2023–2024）**")
+                    st.info(
+                        "验证机制说明：这里使用样本外 OOS（2023–2024）进行检验，并与 S&P 500 基准对照。"
+                        "重点不是单看收益高低，而是同时看 CAGR、Sharpe、最大回撤、信息比率和月度胜率。"
+                        "如果策略在 OOS 中不能稳定优于基准，就只能把它当作筛选参考，而不是直接重仓依据。"
+                    )
+                    cols = st.columns(5)
+                    cols[0].metric(
+                        "策略 CAGR",
+                        f"{m['strategy_cagr']:.1%}",
+                        delta=f"{(m['strategy_cagr']-m['baseline_cagr']):.1%} vs Baseline",
+                        help="年化复合收益率，回答“长期下来能赚多少”。",
+                    )
+                    cols[1].metric(
+                        "Sharpe Ratio",
+                        f"{m['strategy_sharpe']:.2f}",
+                        delta=f"{(m['strategy_sharpe']-m['baseline_sharpe']):.2f} vs Baseline",
+                        help="单位波动带来的超额收益，回答“赚得是否值得承担波动”。",
+                    )
+                    cols[2].metric(
+                        "最大回撤",
+                        f"{m['strategy_max_drawdown']:.1%}",
+                        help="历史上最差从高点跌到低点的幅度，回答“最坏会跌多少”。",
+                    )
+                    cols[3].metric(
+                        "信息比率 IR",
+                        f"{m['information_ratio']:.2f}",
+                        help="策略相对基准的超额收益稳定性，越高说明越常跑赢基准。",
+                    )
+                    cols[4].metric(
+                        "月度胜率",
+                        f"{m['monthly_win_rate']:.1%}",
+                        help="按月比较策略与基准谁更好，反映相对表现的稳定程度。",
+                    )
+
+                    # 净值曲线
+                    nav_df = pd.DataFrame({
+                        "策略组合": results_oos["strategy_nav"],
+                        "S&P 500 Baseline": results_oos["baseline_nav"],
+                    })
+                    fig_nav = px.line(
+                        nav_df, x=nav_df.index, y=["策略组合", "S&P 500 Baseline"],
+                        color_discrete_map={"策略组合": "#f85149", "S&P 500 Baseline": "#58a6ff"},
+                        title="OOS 净值曲线（2023–2024）",
+                    )
+                    fig_nav = apply_chart_theme(fig_nav, height=420)
+                    fig_nav.update_layout(xaxis_title="日期", yaxis_title="净值")
+                    fig_nav.update_traces(
+                        hovertemplate="日期：%{x|%Y-%m-%d}<br>净值：%{y:.3f}<extra>%{fullData.name}</extra>",
+                    )
+                    st.plotly_chart(fig_nav, use_container_width=True)
+
+                    # Baseline 对比表
+                    st.markdown("**策略 vs. Baseline 对比**")
+                    compare_df = pd.DataFrame({
+                        "指标": ["CAGR", "Sharpe Ratio", "最大回撤", "年化波动率"],
+                        "策略": [f"{m['strategy_cagr']:.2%}", f"{m['strategy_sharpe']:.2f}",
+                                 f"{m['strategy_max_drawdown']:.2%}", f"{m['strategy_annualized_vol']:.2%}"],
+                        "Baseline": [f"{m['baseline_cagr']:.2%}", f"{m['baseline_sharpe']:.2f}",
+                                     f"{m['baseline_max_drawdown']:.2%}", f"{m['baseline_annualized_vol']:.2%}"],
+                    })
+                    st.dataframe(
+                        compare_df.style.set_properties(**{"background-color": CHART_BG, "color": CHART_TEXT}),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    st.markdown("**对普通投资者的解读**")
+                    if m["strategy_cagr"] >= m["baseline_cagr"] and m["strategy_sharpe"] >= m["baseline_sharpe"]:
+                        st.success("策略在样本外同时具备更高收益和更好的风险调整后表现，可作为进一步小规模验证的候选方案。")
+                    elif m["strategy_max_drawdown"] > m["baseline_max_drawdown"]:
+                        st.warning("策略收益未必差，但回撤更大，普通投资者应优先控制仓位，避免直接满仓使用。")
+                    else:
+                        st.info("策略更适合作为筛选参考，而不是直接重仓方案；建议结合风险偏好和资金规模做二次筛选。")
+
+                    st.markdown(
+                        """
+                        <div class="insight-box">
+                            <strong>验证结果的含义</strong>
+                            <ul>
+                                <li>CAGR：看长期复合收益，回答“能不能赚到钱”。</li>
+                                <li>Sharpe：看单位波动带来的收益，回答“值不值得承担波动”。</li>
+                                <li>最大回撤：看最坏情况下可能跌多少，回答“我能不能扛住”。</li>
+                                <li>信息比率和月度胜率：看策略相对基准是否稳定胜出。</li>
+                            </ul>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                except Exception as e:
+                    st.error(f"回测失败: {e}")
+                    st.exception(e)
+
+    with tab4:
+        st.markdown("### 🤖 AI 投顾")
+        st.caption("在侧边栏填写 DeepSeek API Key 后会自动启用；API 仅在当前会话内使用，不会写入本地。")
+
+        if not api_key:
+            st.info("请先在侧边栏填写 DeepSeek API Key 和提示词要求。")
+        elif not run_backtest_flag:
+            st.info("已检测到 API Key。请先运行回测，AI 投顾会在结果可用后自动生成建议。")
+        elif results_oos is None:
+            st.warning("当前没有可用的回测结果，请先确保回测成功完成。")
+        else:
             try:
-                results_oos = run_backtest(
-                    prices=prices,
-                    fundamentals=fundamentals,
-                    benchmark_prices=benchmark_prices,
-                    start="2023-01-01",
-                    end="2024-12-31",
-                    top_n=top_n,
-                    risk_profile=risk_profile,
-                    rebalance_freq=rebalance_freq,
-                    weight_method=weight_method,
-                    risk_free_rate=rf_rate,
-                )
-                m = results_oos["metrics"]
+                prompt = _build_ai_advice_prompt(results_oos, top_n_df, portfolio, risk_profile, weight_method, capital)
+                if ai_prompt_requirement.strip():
+                    prompt = ai_prompt_requirement.strip() + "\n\n" + prompt
 
-                # 指标卡
-                st.markdown("**Out-of-Sample 绩效指标（2023–2024）**")
-                cols = st.columns(5)
-                cols[0].metric("策略 CAGR", f"{m['strategy_cagr']:.1%}",
-                                delta=f"{(m['strategy_cagr']-m['baseline_cagr']):.1%} vs Baseline")
-                cols[1].metric("Sharpe Ratio", f"{m['strategy_sharpe']:.2f}",
-                                delta=f"{(m['strategy_sharpe']-m['baseline_sharpe']):.2f} vs Baseline")
-                cols[2].metric("最大回撤", f"{m['strategy_max_drawdown']:.1%}")
-                cols[3].metric("信息比率 IR", f"{m['information_ratio']:.2f}")
-                cols[4].metric("月度胜率", f"{m['monthly_win_rate']:.1%}")
+                cache = st.session_state.setdefault("ai_advisor_cache", {})
+                api_fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+                cache_key = hashlib.sha256((api_fingerprint + "::" + prompt).encode("utf-8")).hexdigest()
 
-                # 净值曲线
-                nav_df = pd.DataFrame({
-                    "策略组合": results_oos["strategy_nav"],
-                    "S&P 500 Baseline": results_oos["baseline_nav"],
-                })
-                fig_nav = px.line(
-                    nav_df, x=nav_df.index, y=["策略组合", "S&P 500 Baseline"],
-                    color_discrete_map={"策略组合": "#f85149", "S&P 500 Baseline": "#58a6ff"},
-                    title="OOS 净值曲线（2023–2024）",
-                )
-                fig_nav = apply_chart_theme(fig_nav, height=420)
-                fig_nav.update_layout(xaxis_title="日期", yaxis_title="净值")
-                st.plotly_chart(fig_nav, use_container_width=True)
+                if cache_key not in cache:
+                    with st.spinner("正在调用 DeepSeek 生成建议..."):
+                        cache[cache_key] = _call_deepseek(api_key, prompt)
 
-                # Baseline 对比表
-                st.markdown("**策略 vs. Baseline 对比**")
-                compare_df = pd.DataFrame({
-                    "指标": ["CAGR", "Sharpe Ratio", "最大回撤", "年化波动率"],
-                    "策略": [f"{m['strategy_cagr']:.2%}", f"{m['strategy_sharpe']:.2f}",
-                             f"{m['strategy_max_drawdown']:.2%}", f"{m['strategy_annualized_vol']:.2%}"],
-                    "Baseline": [f"{m['baseline_cagr']:.2%}", f"{m['baseline_sharpe']:.2f}",
-                                 f"{m['baseline_max_drawdown']:.2%}", f"{m['baseline_annualized_vol']:.2%}"],
-                })
-                st.dataframe(
-                    compare_df.style.set_properties(**{"background-color": CHART_BG, "color": CHART_TEXT}),
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                ai_reply = cache[cache_key]
+                if isinstance(ai_reply, str) and ai_reply.startswith("AI 投顾调用失败："):
+                    st.error(ai_reply)
+                else:
+                    st.markdown("**AI 投顾建议**")
+                    st.write(ai_reply)
 
+                st.caption("AI 投顾的建议基于回测结果和当前组合构建方案，结合了你在提示词中强调的关注点。请务必理解这些建议是基于历史数据和模型推断的，并不保证未来表现；投资决策仍需谨慎。")
             except Exception as e:
-                st.error(f"回测失败: {e}")
-                st.exception(e)
+                st.error(f"AI 投顾调用失败：{e}")
 
 
-# ─── Tab 4: 数据下载 ──────────────────────────────────────────────────────────
-with tab4:
+# ─── Tab 5: 数据下载 ──────────────────────────────────────────────────────────
+with tab5:
     st.markdown("**下载分析结果**")
 
     # Top N CSV

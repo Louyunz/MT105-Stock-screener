@@ -30,6 +30,24 @@ RISK_WEIGHTS = {
     },
 }
 
+# 基准感知模式下的风险偏好权重
+# 说明：balanced 保持原 BENCHMARK_WEIGHTS；其余风格在相对动量主信号下做风险偏好倾斜。
+BENCHMARK_RISK_WEIGHTS = {
+    "conservative": {
+        "relative_momentum": 0.35,
+        "volatility": 0.25,
+        "value": 0.20,
+        "quality": 0.20,
+    },
+    "balanced": BENCHMARK_WEIGHTS,
+    "aggressive": {
+        "relative_momentum": 0.65,
+        "volatility": 0.05,
+        "value": 0.10,
+        "quality": 0.20,
+    },
+}
+
 
 def screen_stocks(
     prices: pd.DataFrame,
@@ -71,8 +89,12 @@ def screen_stocks(
         weights = custom_weights
         logger.info("使用自定义因子权重: %s", weights)
     elif benchmark_prices is not None:
-        weights = BENCHMARK_WEIGHTS
-        logger.info("启用基准相对动量选股，因子权重: %s", weights)
+        weights = BENCHMARK_RISK_WEIGHTS.get(risk_profile, BENCHMARK_WEIGHTS)
+        logger.info(
+            "启用基准相对动量选股，风险偏好=%s，因子权重: %s",
+            risk_profile,
+            weights,
+        )
     else:
         weights = RISK_WEIGHTS.get(risk_profile, DEFAULT_WEIGHTS)
         logger.info("风险偏好=%s，因子权重: %s", risk_profile, weights)
